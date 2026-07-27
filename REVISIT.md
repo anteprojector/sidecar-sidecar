@@ -3,6 +3,33 @@
 Decisions that were right at the time but deserve a second look. Each one is a
 question, not a task — the point is to re-examine, not to assume the answer.
 
+- **`SENTINEL.md` — a rendered, clearable alert inbox on the canonical
+  branch.** Fleet health currently lives entirely in refs: each checkout
+  publishes `sidecar-health/{user}/{id}`, and `sidecar health` reads them back.
+  That deliberately keeps the canonical branch pure notes, but it means the
+  signal is only visible to someone who runs the command — a human browsing the
+  repo on GitHub, or an agent working in a clone, sees nothing. The idea we
+  designed and then set aside was a `SENTINEL.md` rendered into the canonical
+  branch during `merge`, gated by a config boolean, always present rather than
+  appearing only on failure. Its content would be a pure function of the health
+  refs, so a merge conflict resolves by regenerating rather than by merging
+  text, and the push-race retry in `mergeInboxBranchesAt` handles it for free.
+  Worth asking, whenever it comes back up:
+  - Is health even the right first tenant? The more interesting version isn't a
+    health readout at all — it's a general inbox for *clearable alerts*, where
+    anything that wants a human's attention (a redaction false positive worth
+    reviewing, a forked conflict nobody resolved, a machine on a stale version)
+    files an entry and something later clears it. Health would be one producer
+    among several, and the rendering, the clearing protocol, and the "who owns
+    an entry" question are the actual design, not the file format.
+  - What clears an entry, and who decides? Health entries clear themselves —
+    the next good sync overwrites the record. A forked conflict doesn't; it
+    needs a person to say "handled". Those are different lifecycles, and a
+    single file that mixes them needs an answer for both before it's built.
+  - Does it want to be Markdown at all? Rendered Markdown is readable in a diff
+    and on GitHub, which is the whole point — but it's also the format most
+    likely to tempt someone into hand-editing a generated file.
+
 - **How we bundle chokidar, and whether to ship a single embedded executable
   instead.** Today `build` bundles everything *except* chokidar
   (`--external chokidar`), so the published package is a 156 kB `dist/cli.js`
