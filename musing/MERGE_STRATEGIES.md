@@ -1,13 +1,21 @@
-# Opt-in merge strategies
+# Merge strategies and block rules
 
-Status: design musing, 2026-07-28. Not committed to building this; captured
-while the thinking was fresh.
+Status: design musing, revised 2026-07-28. Not committed to building this;
+captured while the thinking was fresh. Decisions marked **decided** were
+settled in discussion; everything under Open questions was not.
 
 Today every automated sync resolves conflicts one way: fork-files. That is the
 right default — nothing blocks, nothing is lost — but some files have a
-*correct* automatic answer (two machines appending to a journal) and some have
-no acceptable automatic answer at all (billing records). This is the design
-for letting paths opt into different strategies.
+*correct* automatic answer (two machines appending to a journal) and some
+content should never leave the machine at all. This is the design for both.
+
+Two separate features share one declaration mechanism:
+
+- **Merge strategies** — how a conflict at a path is resolved. `fork`,
+  `union`, `lww`.
+- **Block rules** — paths that never sync. **Not a merge strategy.** Additive
+  and non-removable: a block declared anywhere in the chain cannot be
+  disabled deeper in the tree.
 
 ## Prior art, briefly
 
@@ -17,164 +25,262 @@ abort the sync and notify — safe, but the repo stalls) and it3xl/git-repo-sync
 silently displaced until they manually recover). Neither found a way to
 actually auto-merge; sidecar's fork-files is a third posture, closest to
 Dropbox/Syncthing "conflicted copy" files but with a committed manifest.
-Per-path strategies would let a repo mix all three postures deliberately.
+Per-path strategies let one repo mix all three postures deliberately.
 
-## The one hard constraint: convergence
+## The spine: convergence
 
 Every machine runs the same merge sweep independently. If two machines
-resolve the same conflict differently, main ping-pongs forever. So a strategy
-must be a **pure function of the two conflicting versions plus committed
-config** — never of "which machine am I" or which side is checked out here.
-Consequences:
+resolve the same conflict differently, main ping-pongs forever. So every
+strategy must be a **pure function of the two conflicting versions plus
+shared, committed rules** — never of "which machine am I", which side is
+checked out here, or which order this machine happened to merge inboxes in.
 
-- Strategy declarations live in shared, committed state — never the
-  machine-local state dir.
-- Inbox merge order must be deterministic (sort branches lexically) so
-  direction-dependent strategies resolve identically everywhere.
-- Side-wins strategies are named by *role* (`canonical` / `incoming`), not
-  direction (`ours` / `theirs` would mean different things on different
-  machines).
+Everything below follows from that, including the two non-obvious
+requirements: union must be commutative and idempotent, and rules must travel
+on the same sync channel as the content they govern.
 
-## The strategy set (closed — no external resolvers, see below)
+## Declaration: nested `.sidecar-rules` files
 
-- **`fork`** — today's behavior; stays the default. Right for anything a
-  human or agent authored.
-- **`union`** — concatenate both sides' additions (git's built-in
-  `merge=union` semantics). Highest-value addition for this domain:
-  append-only agent journals, NDJSON event logs, TODO lists. Most "conflicts"
-  in note streams are two machines appending, where union is simply correct.
-- **`newest`** — last-writer-wins by snapshot commit timestamp,
-  deterministic tiebreak on commit hash. For single-value state files
-  (current-focus pointers, cursors, generated indexes) where any recent
-  version is fine and forked copies are noise.
-- **`canonical` / `incoming`** — deterministic side-wins by role: `canonical`
-  keeps the version already on main; `incoming` takes the inbox's. For files
-  one owner is authoritative over. (git-repo-sync's "conventional" strategy,
-  scoped to paths instead of branches.)
-- **`block`** — never auto-resolve. The conflicting inbox branch is left
-  unmerged (inboxes persist, so nothing is lost), the daemon keeps merging
-  *other* inboxes and repos — block must not wedge the sync — and the stall
-  is surfaced via `sidecar status`, the health heartbeat, and a local system
-  notification. A human resolves manually; the next sweep proceeds. For paths
-  where a wrong auto-resolution is worse than waiting.
+**Decided:** `.sidecar-rules`. It joins the existing `.sidecar` /
+`.sidecar-conflicts/` family, sorts adjacent to `.sidecar` in a listing, and
+leaves room for future siblings.
 
-Deliberately absent:
+Rules nest like `.gitattributes`: the effective ruleset for a path is every
+`.sidecar-rules` found walking from the file's directory up to the parent
+repo boundary (in standalone mode, the repo root). Deeper files take
+precedence over shallower ones; within a file, last match wins. Patterns are
+gitignore-style globs, anchored relative to the containing file's directory.
 
-- **`merge`** — git already does trivial 3-way merges before any strategy
-  fires; by the time one runs, the overlap is real.
-- **`resolver` (external command) — decided against.** A resolver command in
-  committed config is code execution on every machine that syncs the repo;
-  the mitigation (per-machine allowlists, daemon approval prompts,
-  skip-and-flag states) is real UX weight guarding a hole that shouldn't
-  exist. Dropping it makes the strategy set closed and every strategy a pure
-  function of blobs + commit metadata: *nothing in the system executes
-  anything declared in shared content.* The use case (LLM / structured JSON
-  merges) is still reachable through the fork path, post-hoc: manifests
-  preserve both versions with oids and hashes, so a future `sidecar resolve`
-  command — or any agent reading `.sidecar-conflicts/` — can reconcile forked
-  pairs later as an ordinary working-tree edit, a deliberate local action
-  rather than fleet-wide auto-execution. The reserved `--llm` flag's message
-  ("reserved for a configured resolver") should eventually be reworded toward
-  this post-hoc model so it doesn't promise the thing we chose not to build.
-
-## Declaration: three layers
-
-### 1. In-file pragma (most local, self-describing)
+### Format: line-oriented, not TOML
 
 ```
-# sidecar: merge=union
+# strategy rules
+journal/**        merge=union
+state/**          merge=lww
+notes/**.md       merge=fork
+
+# block rules — additive, cannot be disabled deeper
+secrets/**        block
+*.pem             block
 ```
 
-Scanned from the first ~1KB / 16 lines of a conflicting file with a marker
-regex, regardless of comment leader (`#`, `//`, `<!-- -->` all work — no
-per-language comment parsing). Pragmas are the *best* fit for the convergence
-constraint: the strategy becomes a pure function of the versions alone, with
-no shared-state distribution problem. They also self-describe to anyone
-reading the file — including agents, who can adopt a strategy at
-file-creation time without touching shared config or racing a push.
+`<pattern> <attribute>`, where attribute is `merge=fork|union|lww` or
+`block`. Block is an attribute rather than a `merge=` value, so it is
+structurally not a merge strategy.
 
-Rules:
+**Why not TOML, despite `.sidecar` being TOML:** the rules file has to survive
+being union-merged (see below), and a line union of two TOML files that both
+set the same key produces duplicate keys and an unparseable file. Any set of
+lines is a valid line-oriented rules file, so union is structurally safe with
+no content-aware special case. It also makes last-match-wins natural and
+diffs cleanly.
 
-- Both current sides (stages 2 and 3) must declare the same strategy;
-  disagreement — including one side removing the pragma — falls through to
-  the next layer. A dispute over the strategy itself is exactly a case for
-  forking.
-- Pragmas are file content, the least-trusted input in the system, so they
-  may select only content-level strategies (`union`, `newest`, `fork`) and
-  may never downgrade a config-declared `block`.
-- Cost is negligible: only files that actually conflicted are scanned.
+### Not in `.sidecar` — **decided**
 
-### 2. Filename marker
+In **standalone** mode (`path = "."`) `.sidecar` and `.sidecar-rules` are
+siblings in the same synced directory, so allowing both just splits rules
+across two files for no gain. In **nested** mode `.sidecar` lives in the
+*parent* repo, outside the sync channel entirely: it propagates only when a
+human pushes and pulls the parent, while its subject matter propagates every
+minute. That is invisible rule skew, and skewed rules break convergence.
 
-`events.union.ndjson` → union; implemented as nothing more than built-in glob
-rules (`**/*.union.*`, `**/*.newest.*`). Covers the two cases pragmas can't —
-JSON (no comments) and binary files — and self-describes in a directory
-listing.
+The checkout-root `.sidecar-rules` is the root of the chain in both modes.
+`.sidecar` keeps its single job: identity and transport.
 
-### 3. Rules file, in the sidecar checkout (not `.sidecar`)
+### Rejected: in-file pragmas and filename markers
 
-```toml
-default = "fork"
+An earlier draft had `# sidecar: merge=union` pragmas and `*.union.ndjson`
+filename markers. Both were dropped as footguns. The pragma's "both sides
+must agree" rule was papering over the fact that untrusted file content —
+writable by any machine or agent — was steering the merge, and a strategy
+that silently changes when someone edits a comment is not a strategy anyone
+can reason about. Filename markers make a file's identity load-bearing:
+renaming changes semantics, and the marker is invisible to anyone reading the
+file itself.
 
-[[rule]]
-path = "journal/**/*.md"
-strategy = "union"
+## Strategies
 
-[[rule]]
-path = "state/**"
-strategy = "newest"
+### `fork` — the default
 
-[[rule]]
-path = "billing/**"
-strategy = "block"
-```
+Today's behavior: both versions written out as sibling files, original
+removed, a manifest written to `.sidecar-conflicts/`. Right for anything a
+human or agent authored, and the fallback whenever another strategy cannot
+apply.
 
-Gitignore-style globs, **last match wins** — semantics every git user already
-has intuitions for. Per-dir and per-file fall out of the same mechanism.
+### `union` — commutative, idempotent, content-blind
 
-Why not `.sidecar`? Skew. `.sidecar` is committed in the *parent* repo, which
-syncs at human pace, while the sidecar checkout syncs every minute — a rules
-change in `.sidecar` could take days to reach other machines, during which
-they resolve conflicts differently. A rules file *inside the sidecar
-checkout* (say `.conflict-rules.toml`) distributes through sidecar's own
-sync channel and converges within a minute. With resolvers gone it carries
-only strategy names — pure data, no security dimension. Bootstrap wrinkle:
-the rules file needs a pinned, hardcoded strategy for its own conflicts — pin
-`newest` (forking it would silently deactivate everyone's rules).
+Git's built-in `merge=union` concatenates ours-then-theirs and never dedupes,
+which is **not** safe here: two machines merging the same inboxes in different
+orders, or against different partially-merged bases, produce different blobs,
+push, re-conflict, and re-union — accumulating duplicate lines forever.
 
-### Precedence (most-local wins, except where trust forbids)
+The fix is to make union a *set* operation with a total order that does not
+depend on merge direction or merge path:
 
-1. Config `block` rules — not overridable from below
-2. In-file pragma (safe strategies only; both sides must agree)
-3. Filename marker
-4. Rules-file globs, last match wins
-5. Default (`fork`)
+- **Order key: per-line introduction time.** Git blame attributes a line to
+  the commit that actually introduced it, and that attribution survives
+  merges — so it is invariant to which machine merged what in which order.
+  Sort conflicting-hunk lines by `(introduction commit time, commit oid,
+  index within that commit's addition)`. All three components are
+  deterministic; the oid tiebreak covers equal timestamps across machines.
+- **Dedupe by line identity**, not by text: a line is identified by its
+  introduction commit plus its index within that commit's addition. Re-unioning
+  already-unioned content is therefore a no-op (idempotence), while two
+  genuinely distinct occurrences of the same text — repeated separators, a
+  log line that legitimately recurs — both survive.
+- **Only conflicting hunks are reordered.** Non-conflicting regions merge
+  normally and keep their position, so a hand-edit elsewhere in the file is
+  untouched.
+- **Fall back to fork** for non-text content or when blame data is
+  unavailable.
+
+Note what this deliberately does *not* do: it never inspects content
+semantics, parses timestamps out of log lines, or sorts lexically. It is
+metadata-driven and works on any line-oriented text.
+
+Considered and rejected: keying order on each side's *tip* commit time. It is
+much cheaper (no blame) and is commutative for a single pair, but it is not
+order-independent across a multi-inbox sweep — merging inbox B then C versus C
+then B re-derives keys from a different base and diverges.
+
+### `lww` — last write wins
+
+Whole-file granularity — per-hunk lww has no coherent meaning. Winner is
+decided by committer timestamp, tiebroken deterministically on commit oid.
+
+The honest caveat: this trusts machine clocks, so a machine with a fast clock
+always wins. Health heartbeats already carry per-machine data and could detect
+skew. For single-value state — cursors, current-focus pointers, generated
+indexes — where any recent version is fine and forked copies are pure noise.
+
+### Delete/modify conflicts
+
+Undefined for all three strategies, so hardcode it: **deletion never wins over
+content**, regardless of the declared strategy. Keep the surviving version and
+log it to the manifest. A notes repo should not lose content to a race.
+
+### Not included
+
+`merge` (git already does trivial 3-way merges before any strategy fires — by
+the time one runs, the overlap is real), `canonical`/`incoming` (deferred, not
+rejected), and external resolver commands.
+
+**Resolvers were decided against.** A resolver command in committed config is
+code execution on every machine that syncs the repo; the mitigation
+(per-machine allowlists, daemon approval prompts, skip-and-flag states) is
+real UX weight guarding a hole that shouldn't exist. Dropping it keeps the
+strategy set closed and every strategy a pure function of blobs plus commit
+metadata: *nothing in the system executes anything declared in shared
+content.* The use case — LLM or structured JSON merges — is still reachable
+post-hoc: fork manifests preserve both versions with oids and hashes, so a
+future `sidecar resolve` can reconcile forked pairs later as an ordinary local
+edit rather than fleet-wide auto-execution. The reserved `--llm` flag's
+message ("reserved for a configured resolver") should eventually be reworded
+toward this model so it stops promising the thing we chose not to build.
+
+## Block rules
+
+Additive and non-removable. There is no negation syntax — a block matching
+anywhere in the chain wins, and no deeper file can undo it. That is the whole
+point: protection can only ever be added.
+
+- **Enforced at snapshot, never at merge.** A merge-time filter is useless —
+  the content is already committed to the inbox and pushed, so the secret has
+  already left the machine. Block must prevent the `git add` entirely.
+- **Skip and report; do not error — decided.** Erroring would wedge the
+  daemon: one constantly-rewritten blocked file (a log, an `.env`) would fail
+  every sync forever, and the sync must keep making progress on everything
+  else. This mirrors the existing soft-request philosophy in the lock
+  handling. Silence is equally wrong — "I thought that was backed up" is the
+  one surprise you cannot afford. So: skip the path, complete the sync,
+  surface a blocked-path count in `sidecar status` plus an event-log entry.
+  Not a notification per change. A manual command that explicitly targets a
+  blocked path may error, since that is a demand rather than a background
+  pass.
+- **Block cannot retroactively unpublish.** Adding a rule for a path that
+  already synced leaves the content in remote history. Say so loudly rather
+  than implying protection that isn't there.
+- **Old CLIs will not honor blocks — accepted.** The pinned project-local CLI
+  invariant means a machine may run a version that has never heard of
+  `.sidecar-rules` and will happily snapshot and push blocked content. There
+  is no way to make an old binary respect a new rule. Detection is still worth
+  it: heartbeats already carry per-machine versions, so status could flag
+  "block rules present; machine X runs a CLI too old to honor them."
+- **Why not just `.gitignore`?** Gitignore permits `!` negation and
+  per-checkout overrides, which is exactly the additivity block exists to
+  guarantee. Implementation may still use git's exclude machinery underneath.
+- **Machine-local block is out of scope — decided.** That is just
+  `.gitignore`, which already works.
+
+## The rules file's own conflicts
+
+`.sidecar-rules` is synced content and can itself conflict. Pinned strategy:
+**early validation, then `union`** — no content-aware special case needed,
+because the line-oriented format makes any union result structurally valid.
+
+This is fail-safe in the direction that matters: union never deletes, so a
+block rule can never silently vanish in a merge. Contradictory `merge=` lines
+for the same pattern both survive, and last-match-wins resolves them
+deterministically because union's ordering is deterministic — effectively the
+later-declared rule wins. The accepted downside is that *deleting* a rule can
+be undone by any machine still carrying the old version; it re-deletes once
+the fleet converges.
+
+Validation is where safety comes from. Reject invalid files at write time, and
+fail closed on read: a malformed `.sidecar-rules` must not degrade to "no
+rules", since that would silently deactivate a block. Refuse to sync that repo
+with a clear error, matching the redaction filter's existing fail-closed
+stance.
 
 ## Implementation notes
 
-- There is already a single choke point: `forkConflicts` iterates unmerged
-  paths with both sides' blobs in hand during the inbox sweep. Per-path
-  strategies are a dispatch table in front of that loop, not a merge rework.
+- There is already a single choke point for strategies: `forkConflicts`
+  iterates unmerged paths with both sides' blobs in hand during the inbox
+  sweep. Per-path strategies are a dispatch table in front of that loop, not a
+  merge rework. Block, by contrast, belongs in snapshot.
+- **Read rules from the canonical branch state being merged into**, not from
+  the working tree, or determinism leaks.
+- **Deterministic inbox merge order** (sort branches lexically) — necessary
+  regardless of union's internal ordering.
 - Keep dispatch sidecar-side rather than compiling to `.gitattributes` merge
-  drivers: custom drivers need per-machine `.git/config` wiring anyway,
-  `newest` needs commit metadata git doesn't hand to drivers, and one code
-  path beats two. (gitattributes `merge=union` could be honored as an
-  implementation detail, but users declare in sidecar's own layers.)
+  drivers: custom drivers need per-machine `.git/config` wiring anyway, `lww`
+  needs commit metadata git doesn't hand to drivers, and one code path beats
+  two.
 - Every non-fork resolution still writes a `.sidecar-conflicts/` manifest
-  entry — `resolved_by` plus `declared_by: "pragma" | "filename" | "rule" |
-  "default"` and both oids — so auto-resolution is auditable and a surprising
-  outcome is diagnosable after the fact.
-- Old-CLI compat: unknown config keys are already ignored, so old CLIs fall
-  back to fork-everything — safe. State that as the explicit contract.
-- Agent-facing docs get a one-liner: "starting an append-only log? put
-  `# sidecar: merge=union` at the top or name it `*.union.ndjson`."
+  entry — `resolved_by` plus the declaring file and line — so auto-resolution
+  is auditable and a surprising outcome is diagnosable after the fact.
+- **Ship `sidecar rules <path>`** alongside the feature: print the effective
+  strategy and block status for a path plus the file and line that declared
+  it, like `git check-attr` / `git check-ignore -v`. Nested rule systems are
+  miserable to debug without it.
+- Old-CLI compat: an unknown rules file is simply unread, so old CLIs fall
+  back to fork-everything and no blocks — safe for strategies, accepted for
+  block.
+
+## Open questions
+
+- **Is blame fast enough?** Union needs per-line introduction data for every
+  conflicting file. Scoped to conflicting hunks (`git blame -L`) on
+  notes-sized files it should be fine, but it is unmeasured.
+- **Forward compat vs fail-closed on unknown attributes.** A malformed line
+  should fail closed. But a *well-formed* line with an attribute a newer CLI
+  understands and this one doesn't — fail closed (safe, but a newer machine
+  can halt older ones fleet-wide) or ignore-with-warning (evolvable, but a
+  future block variant would be silently ignored)? Leaning ignore-with-warning;
+  not settled.
+- **Rules file cruft.** Union accumulates superseded `merge=` lines. Worth a
+  `sidecar rules --prune`, or just tolerable?
+- **Inbound content at a blocked path** — flagged, or removed? Blocks are
+  fleet-wide, so this only arises with stale rules or old CLIs.
+- **`canonical` / `incoming`** — deferred. Deterministic side-wins by role
+  (never `ours`/`theirs`, which mean different things on different machines),
+  for files one machine is authoritative over.
 
 ## Phasing, if built
 
-1. `union` + the rules-file dispatch (small, git-proven semantics, biggest
-   payoff for note streams)
-2. Pragma + filename markers
-3. `newest`, `canonical`/`incoming`
-4. `block` (carries the daemon-UX weight: leave-inbox-unmerged, health
-   surfacing, status flag)
-5. Post-hoc `sidecar resolve` for forked pairs (the ex-`--llm` story)
+1. `.sidecar-rules` parsing, nesting, and `sidecar rules <path>` — the
+   mechanism, with only `fork` wired up. No behavior change.
+2. Block rules at snapshot, with status/event-log surfacing.
+3. `union`, including the blame-ordered set semantics and fork fallback.
+4. `lww`.
+5. Post-hoc `sidecar resolve` for forked pairs (the ex-`--llm` story).
