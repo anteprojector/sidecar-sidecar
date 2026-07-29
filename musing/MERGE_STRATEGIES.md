@@ -335,6 +335,13 @@ stance.
 - Every non-fork resolution still writes a `.sidecar-conflicts/` manifest
   entry — `resolved_by` plus the declaring file and line — so auto-resolution
   is auditable and a surprising outcome is diagnosable after the fact.
+- **Convergence and never-drop need property tests, not unit tests.** Union's
+  commutativity and idempotence are exactly what hand-written cases miss. The
+  harness worth building: N synthetic machines, random edits, random inbox
+  merge orders, then assert (a) every machine lands on an identical tree and
+  (b) every line ever committed on any inbox appears exactly once in the
+  result, modulo uncontested deletions. Treat that harness as part of union's
+  cost.
 - **Ship `sidecar rules <path>`** alongside the feature: print the effective
   strategy and freeze state for a path plus the file and line that declared
   it, like `git check-attr` / `git check-ignore -v`. Nested rule systems are
