@@ -113,7 +113,12 @@ removed, a manifest written to `.sidecar-conflicts/`. Right for anything a
 human or agent authored, and the fallback whenever another strategy cannot
 apply.
 
-### `union` — commutative, idempotent, content-blind
+### `union` — never drops a line
+
+**Decided:** union earns its complexity. It is expected to be the second most
+common strategy, and the driving use case is agent-written logs, which carries
+a hard invariant: **a union must never drop a log item.** Everything below
+follows from that plus convergence.
 
 Git's built-in `merge=union` concatenates ours-then-theirs and never dedupes,
 which is **not** safe here: two machines merging the same inboxes in different
@@ -123,26 +128,55 @@ push, re-conflict, and re-union — accumulating duplicate lines forever.
 The fix is to make union a *set* operation with a total order that does not
 depend on merge direction or merge path:
 
-- **Order key: per-line introduction time.** Git blame attributes a line to
-  the commit that actually introduced it, and that attribution survives
-  merges — so it is invariant to which machine merged what in which order.
-  Sort conflicting-hunk lines by `(introduction commit time, commit oid,
-  index within that commit's addition)`. All three components are
-  deterministic; the oid tiebreak covers equal timestamps across machines.
-- **Dedupe by line identity**, not by text: a line is identified by its
-  introduction commit plus its index within that commit's addition. Re-unioning
-  already-unioned content is therefore a no-op (idempotence), while two
-  genuinely distinct occurrences of the same text — repeated separators, a
-  log line that legitimately recurs — both survive.
+- **Identity is `(origin commit oid, original line number)`**, both read
+  straight from `git blame -p`. Dedupe on *identity*, never on text. This is
+  the crux of the never-drop invariant: text dedupe would silently collapse
+  two agents emitting the same message into one, and those are two real
+  events. Under identity dedupe, re-unioning already-unioned content is a
+  no-op (idempotence), while every distinct occurrence survives — repeated
+  separators, a log line that legitimately recurs, two machines logging the
+  same string in the same second.
+- **Order key: per-line introduction time.** Blame attributes a line to the
+  commit that actually introduced it, and that attribution survives merges —
+  so it is invariant to which machine merged what in which order. Sort
+  conflicting-hunk lines by `(origin commit time, commit oid, original line
+  number)`. All three components are deterministic; the oid tiebreak covers
+  equal timestamps across machines.
 - **Only conflicting hunks are reordered.** Non-conflicting regions merge
   normally and keep their position, so a hand-edit elsewhere in the file is
   untouched.
 - **Fall back to fork** for non-text content or when blame data is
-  unavailable.
+  unavailable. Fork is still never-drop — both versions survive as files —
+  but it breaks the log's continuity by emptying its path, so it should be
+  rare and reported.
 
 Note what this deliberately does *not* do: it never inspects content
 semantics, parses timestamps out of log lines, or sorts lexically. It is
 metadata-driven and works on any line-oriented text.
+
+### What never-drop costs
+
+The invariant has three consequences worth stating plainly, because they are
+what make union a per-path opt-in rather than a better default:
+
+- **Under union, an edit is an add.** A modified line has a new identity while
+  the old line still exists on the other side, so both survive — modifications
+  accumulate instead of replacing. That is exactly right for an append-only
+  log and wrong for almost everything else. Never-drop and in-place editing
+  cannot coexist.
+- **Deletion works, but only uncontested.** Log rotation and truncation merge
+  cleanly when the other side didn't touch the removed region — union only
+  applies to *conflicting* hunks, so nothing resurrects. If both sides did
+  touch that region, the removed lines come back. Pruning a union'd file is
+  therefore possible but racy, which is the honest answer to "does this grow
+  forever?"
+- **Ordering is commit-time, not write-time.** Lines cluster by the snapshot
+  that carried them, so under the normal debounce the granularity is about a
+  minute, and a machine that was offline for hours contributes one dense
+  batch rather than interleaving. Nothing is lost or misattributed; the
+  interleaving is just coarser than wall-clock. Content-blindness forbids
+  reading timestamps out of the lines themselves, and log lines that carry
+  their own timestamps can always be re-sorted by a reader.
 
 Considered and rejected: keying order on each side's *tip* commit time. It is
 much cheaper (no blame) and is commutative for a single pair, but it is not
