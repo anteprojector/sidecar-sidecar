@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "machine": "zack@Zacks-MacBook-Air-3",
+  "root": "/private/tmp/rev",
+  "inbox": "sidecar-inbox/zack/62f39fa60d7e",
+  "version": "1.3.0",
+  "status": "failed",
+  "updatedAt": "2026-07-30T06:10:25.048Z",
+  "lastFailureAt": "2026-07-30T06:10:25.048Z",
+  "consecutiveFailures": 7,
+  "stage": "settle",
+  "message": "fatal: cannot change to '/private/tmp/pr6/sidecar': No such file or directory"
+}
