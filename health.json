@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "machine": "zack@Zacks-MacBook-Air-3",
+  "root": "/private/tmp/pr6wt",
+  "inbox": "sidecar-inbox/zack/44974e5a6936",
+  "version": "1.3.0",
+  "status": "ok",
+  "updatedAt": "2026-07-30T05:06:08.089Z",
+  "lastSuccessAt": "2026-07-30T05:06:08.089Z",
+  "consecutiveFailures": 0
+}
