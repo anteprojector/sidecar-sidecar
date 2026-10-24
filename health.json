@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "machine": "eleven@Foxs-Mac-mini",
+  "root": "/Users/eleven/.t3/worktrees/sidecar/fix-redaction-shell-pwd",
+  "inbox": "sidecar-inbox/eleven/5f8439b3a0fe",
+  "version": "2.1.2",
+  "status": "ok",
+  "updatedAt": "2026-10-24T22:36:22.844Z",
+  "lastSuccessAt": "2026-10-24T22:36:22.844Z",
+  "consecutiveFailures": 0
+}
