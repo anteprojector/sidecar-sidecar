@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "machine": "eleven@Foxs-Mac-mini",
+  "root": "/Users/eleven/.t3/worktrees/sidecar/fix-sync-under-edit-bursts",
+  "inbox": "sidecar-inbox/eleven/5bfda9d0ef7e",
+  "version": "2.1.2",
+  "status": "ok",
+  "updatedAt": "2026-10-24T22:15:01.383Z",
+  "lastSuccessAt": "2026-10-24T22:15:01.383Z",
+  "consecutiveFailures": 0
+}
